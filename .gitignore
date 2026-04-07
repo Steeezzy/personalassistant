@@ -1,3 +1,4 @@
 __pycache__/
 *.pyc
 .qodo/
+.jarvis_memory.json
