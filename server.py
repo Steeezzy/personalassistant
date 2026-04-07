@@ -19,9 +19,13 @@ MAX_ITERATIONS = 3
 MAX_STATE_RESULTS = 2
 MAX_STATE_TEXT = 500
 RATE_LIMIT_SECONDS = 1.0
+MAX_MEMORY_ITEMS = 10
+MAX_SEARCH_RESULTS = 20
+MAX_SEARCH_FILE_BYTES = 50000
+MEMORY_FILE = os.path.join(BASE_DIR, ".jarvis_memory.json")
 
 ALLOWED_COMMANDS = ["ls", "pwd"]
-ALLOWED_ACTIONS = ["list_files", "read_file", "write_file", "run_command"]
+ALLOWED_ACTIONS = ["list_files", "read_file", "run_command", "search_project"]
 ALLOWED_MODES = ["PLAN", "REPAIR", "CONTINUE"]
 
 last_call = {}
@@ -29,27 +33,25 @@ last_call = {}
 ALLOWED_FIELDS = {
     "list_files": {"action", "path"},
     "read_file": {"action", "path"},
-    "write_file": {"action", "path", "content"},
     "run_command": {"action", "cmd"},
+    "search_project": {"action", "query"},
 }
 
 
-FINAL_AGENT_PROMPT = """
-You are a strict autonomous task controller.
+FINAL_PROMPT = """
+You are an autonomous system controller.
 
-Your job is to:
-1. Understand the user goal
-2. Plan ALL required steps
-3. Evaluate progress using previous actions and results
-4. Repair incomplete plans
-5. Continue execution if needed
-6. Decide when the task is truly complete
+Your role is to:
+- Understand the user goal
+- Use available tools to complete the task
+- Track progress using memory and previous results
+- Plan, repair, and continue execution until completion
 
-You MUST behave deterministically and conservatively.
+You must act deterministically and safely.
 
 ---
 
-INPUT CONTEXT:
+INPUT:
 
 USER INPUT:
 {user_input}
@@ -57,13 +59,16 @@ USER INPUT:
 GOAL:
 {goal}
 
+MEMORY:
+{memory}
+
 COMPLETED ACTIONS:
 {completed_actions}
 
 PREVIOUS STEPS:
 {previous_steps}
 
-RESULTS (summarized):
+RESULTS:
 {results}
 
 ---
@@ -71,73 +76,81 @@ RESULTS (summarized):
 AVAILABLE ACTIONS:
 
 1. list_files
-   {"action":"list_files","path":"."}
+     {"action":"list_files","path":"."}
 
 2. read_file
-   {"action":"read_file","path":"file.txt"}
+     {"action":"read_file","path":"file.txt"}
 
-3. write_file
-   {"action":"write_file","path":"file.txt","content":"text"}
+3. run_command
+     {"action":"run_command","cmd":"ls"}
 
-4. run_command
-   {"action":"run_command","cmd":"ls"}
+4. search_project
+     {"action":"search_project","query":"keyword"}
 
 ---
 
-CONSTRAINTS:
+RULES:
 
 - Output ONLY valid JSON
-- No markdown, no explanation
+- No markdown or explanation
 - Max 5 steps
-- run_command only supports: ls, pwd
 - No destructive actions
-- Always include ALL required steps
-- Never skip parts of the request
+- run_command only allows: ls, pwd
+- Never hallucinate files or paths
+- Always use previous results to guide next steps
 
 ---
 
 TASK MODES:
 
-You MUST choose one:
+Choose one:
 
-1. PLAN -> create full plan
-2. REPAIR -> fix incomplete plan
-3. CONTINUE -> continue unfinished task
+PLAN -> create full step plan
+REPAIR -> fix incomplete or incorrect plan
+CONTINUE -> continue unfinished execution
 
 ---
 
-COMPLETION RULES:
+COMPLETION RULE:
 
-Mark "complete": true ONLY IF:
+Set "complete": true ONLY IF:
 - All parts of USER INPUT are satisfied
-- No remaining actions needed
+- No further steps are required
 
-If ANY part is missing -> complete must be false
+If uncertain -> complete must be false
 
 ---
 
 FAILURE HANDLING:
 
 If:
-- previous steps failed
-- results are incomplete
-- or task partially done
+- results show error
+- steps incomplete
+- goal not achieved
 
-You MUST:
+Then:
 - switch to CONTINUE or REPAIR
 - generate next steps
+
+---
+
+MEMORY USAGE:
+
+- Use MEMORY to recall past actions and preferences
+- Do NOT repeat actions unnecessarily
+- Prefer efficient execution
 
 ---
 
 OUTPUT FORMAT:
 
 {
-  "mode": "PLAN | REPAIR | CONTINUE",
-  "complete": true/false,
-  "confidence": 0.0-1.0,
-  "steps": [
-    {"action":"action_name","param":"value"}
-  ]
+    "mode": "PLAN | REPAIR | CONTINUE",
+    "complete": true/false,
+    "confidence": 0.0-1.0,
+    "steps": [
+        {"action":"action_name","param":"value"}
+    ]
 }
 
 ---
@@ -146,42 +159,34 @@ EXAMPLES:
 
 User: show files
 {
-  "mode": "PLAN",
-  "complete": true,
-  "confidence": 0.9,
-  "steps": [
-    {"action":"list_files","path":"."}
-  ]
+    "mode": "PLAN",
+    "complete": true,
+    "confidence": 0.9,
+    "steps": [
+        {"action":"list_files","path":"."}
+    ]
 }
 
 User: read server.py and list files
 {
-  "mode": "PLAN",
-  "complete": true,
-  "confidence": 0.9,
-  "steps": [
-    {"action":"read_file","path":"server.py"},
-    {"action":"list_files","path":"."}
-  ]
+    "mode": "PLAN",
+    "complete": true,
+    "confidence": 0.9,
+    "steps": [
+        {"action":"read_file","path":"server.py"},
+        {"action":"list_files","path":"."}
+    ]
 }
 
-User: partially done
+User: continue task
 {
-  "mode": "CONTINUE",
-  "complete": false,
-  "confidence": 0.6,
-  "steps": [
-    {"action":"list_files","path":"."}
-  ]
+    "mode": "CONTINUE",
+    "complete": false,
+    "confidence": 0.6,
+    "steps": [
+        {"action":"list_files","path":"."}
+    ]
 }
-
----
-
-SCORING RULES:
-
-- High confidence (0.8-1.0): all steps correct and complete
-- Medium (0.5-0.7): likely correct but uncertain
-- Low (<0.5): incomplete or unsure
 
 ---
 
@@ -189,10 +194,10 @@ FAIL SAFE:
 
 If unclear or unsafe:
 {
-  "mode": "PLAN",
-  "complete": false,
-  "confidence": 0.0,
-  "steps": []
+    "mode": "PLAN",
+    "complete": false,
+    "confidence": 0.0,
+    "steps": []
 }
 """
 
@@ -224,6 +229,53 @@ def ask_llm_with_retry(prompt, label_prefix="RAW", max_attempts=2):
         if response:
             return response, responses
     return None, responses
+
+
+def load_memory():
+    default_memory = {
+        "recent_goals": [],
+        "recent_actions": [],
+    }
+
+    if not os.path.exists(MEMORY_FILE):
+        return default_memory
+
+    try:
+        with open(MEMORY_FILE, "r", encoding="utf-8") as memory_file:
+            data = json.load(memory_file)
+    except Exception:
+        return default_memory
+
+    if not isinstance(data, dict):
+        return default_memory
+
+    recent_goals = data.get("recent_goals", [])
+    recent_actions = data.get("recent_actions", [])
+    if not isinstance(recent_goals, list):
+        recent_goals = []
+    if not isinstance(recent_actions, list):
+        recent_actions = []
+
+    return {
+        "recent_goals": recent_goals[-MAX_MEMORY_ITEMS:],
+        "recent_actions": recent_actions[-MAX_MEMORY_ITEMS:],
+    }
+
+
+def save_memory(goal, completed_actions):
+    memory = load_memory()
+    if goal:
+        memory["recent_goals"].append(goal)
+
+    for action in completed_actions:
+        if action:
+            memory["recent_actions"].append(action)
+
+    memory["recent_goals"] = memory["recent_goals"][-MAX_MEMORY_ITEMS:]
+    memory["recent_actions"] = memory["recent_actions"][-MAX_MEMORY_ITEMS:]
+
+    with open(MEMORY_FILE, "w", encoding="utf-8") as memory_file:
+        json.dump(memory, memory_file, ensure_ascii=True, indent=2)
 
 
 def extract_goal(user_input):
@@ -265,10 +317,11 @@ def summarize_execution_for_state(execution_result):
 
 
 def render_final_prompt(user_input, state, previous_steps):
-    prompt = FINAL_AGENT_PROMPT
+    prompt = FINAL_PROMPT
     replacements = {
         "{user_input}": user_input,
         "{goal}": state["goal"],
+        "{memory}": json.dumps(state["memory"], ensure_ascii=False),
         "{completed_actions}": json.dumps(state["completed_actions"], ensure_ascii=False),
         "{previous_steps}": json.dumps(previous_steps, ensure_ascii=False),
         "{results}": json.dumps(state["results"], ensure_ascii=False),
@@ -369,8 +422,8 @@ def infer_plan_gaps(user_input, steps):
     if re.search(r"\bread\b", text) and "read_file" not in actions:
         gaps.append("missing:read_file")
 
-    if re.search(r"\bwrite\b", text) and "write_file" not in actions:
-        gaps.append("missing:write_file")
+    if re.search(r"\b(search|find|lookup|look\s+for)\b", text) and "search_project" not in actions:
+        gaps.append("missing:search_project")
 
     if re.search(r"\b(show\s+)?current\s+directory\b|\bpwd\b", text):
         has_pwd = any(
@@ -399,16 +452,11 @@ def infer_plan_gaps(user_input, steps):
 
 
 def infer_forbidden_actions(user_input, steps):
-    text = user_input.lower()
     forbidden = []
 
-    write_requested = bool(re.search(r"\b(write|create|save|update|modify|edit|append|overwrite)\b", text))
-    has_write = any(
-        isinstance(step, dict) and step.get("action") == "write_file"
-        for step in steps
-    )
-    if has_write and not write_requested:
-        forbidden.append("unexpected:write_file")
+    for step in steps:
+        if isinstance(step, dict) and step.get("action") == "write_file":
+            forbidden.append("unexpected:write_file")
 
     return forbidden
 
@@ -425,6 +473,12 @@ def deterministic_plan_fallback(user_input):
 
     if re.search(r"\b(show\s+)?current\s+directory\b|\bpwd\b", text):
         steps.append({"action": "run_command", "cmd": "pwd"})
+
+    search_match = re.search(r"\b(?:search|find|lookup|look\s+for)\b(?:\s+project)?(?:\s+for)?\s+(.+)", text)
+    if search_match:
+        query_value = search_match.group(1).strip()
+        if query_value:
+            steps.append({"action": "search_project", "query": query_value})
 
     if not steps:
         return []
@@ -473,21 +527,16 @@ def validate_step(step):
     if action == "read_file" and "path" not in step:
         return False
 
-    if action == "write_file" and ("path" not in step or "content" not in step):
+    if action == "run_command" and "cmd" not in step:
         return False
 
-    if action == "run_command" and "cmd" not in step:
+    if action == "search_project" and "query" not in step:
         return False
 
     if action == "list_files" and "path" in step and not isinstance(step.get("path"), str):
         return False
 
     if action == "read_file" and not isinstance(step.get("path"), str):
-        return False
-
-    if action == "write_file" and (
-        not isinstance(step.get("path"), str) or not isinstance(step.get("content"), str)
-    ):
         return False
 
     if action == "run_command":
@@ -497,6 +546,9 @@ def validate_step(step):
         parts = cmd.split()
         if len(parts) != 1 or parts[0] not in ALLOWED_COMMANDS:
             return False
+
+    if action == "search_project" and not isinstance(step.get("query"), str):
+        return False
 
     return True
 
@@ -529,16 +581,6 @@ def read_file(path):
         return file_obj.read()
 
 
-def write_file(path, content):
-    path = safe_path(path)
-    if len(content) > MAX_FILE_SIZE:
-        raise Exception("Content too large")
-
-    with open(path, "w", encoding="utf-8") as file_obj:
-        file_obj.write(content)
-    return "written"
-
-
 def run_command(cmd):
     parts = cmd.split()
 
@@ -554,6 +596,50 @@ def run_command(cmd):
     return subprocess.getoutput(cmd)
 
 
+def search_project(query):
+    if not isinstance(query, str) or not query.strip():
+        return {"error": "invalid_query"}
+
+    query_text = query.strip().lower()
+    matches = []
+    excluded_dirs = {".git", "__pycache__", ".qodo"}
+
+    for root, dirs, files in os.walk(BASE_DIR):
+        dirs[:] = [dir_name for dir_name in dirs if dir_name not in excluded_dirs]
+
+        for file_name in files:
+            if len(matches) >= MAX_SEARCH_RESULTS:
+                return matches
+
+            abs_path = os.path.join(root, file_name)
+            rel_path = os.path.relpath(abs_path, BASE_DIR)
+
+            if query_text in rel_path.lower():
+                matches.append({"path": rel_path, "match": "path"})
+                continue
+
+            try:
+                if os.path.getsize(abs_path) > MAX_SEARCH_FILE_BYTES:
+                    continue
+
+                with open(abs_path, "r", encoding="utf-8", errors="ignore") as file_obj:
+                    for line_no, line in enumerate(file_obj, start=1):
+                        if query_text in line.lower():
+                            matches.append(
+                                {
+                                    "path": rel_path,
+                                    "match": "content",
+                                    "line": line_no,
+                                    "snippet": line.strip()[:120],
+                                }
+                            )
+                            break
+            except Exception:
+                continue
+
+    return matches
+
+
 def execute(action):
     if action["action"] == "list_files":
         return list_files(action.get("path", "."))
@@ -561,11 +647,11 @@ def execute(action):
     if action["action"] == "read_file":
         return read_file(action["path"])
 
-    if action["action"] == "write_file":
-        return write_file(action["path"], action["content"])
-
     if action["action"] == "run_command":
         return run_command(action["cmd"])
+
+    if action["action"] == "search_project":
+        return search_project(action["query"])
 
     return "no action"
 
@@ -643,6 +729,7 @@ def run_task(data: dict, request: Request):
 
     state = {
         "goal": extract_goal(user_input),
+        "memory": load_memory(),
         "completed_actions": [],
         "results": [],
     }
@@ -717,6 +804,7 @@ def run_task(data: dict, request: Request):
                     state["results"] + summarize_execution_for_state(execution_result)
                 )[-MAX_STATE_RESULTS:]
 
+                save_memory(state["goal"], state["completed_actions"])
                 return {"results": all_results, "fallback": True}
 
             error_reason = reason if not valid else "Incomplete or unsafe plan"
@@ -766,6 +854,7 @@ def run_task(data: dict, request: Request):
         )[-MAX_STATE_RESULTS:]
 
         if complete and is_truly_complete(user_input, steps):
+            save_memory(state["goal"], state["completed_actions"])
             return {"results": all_results}
 
         if complete:
