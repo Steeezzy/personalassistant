@@ -4,12 +4,13 @@ import os
 import re
 import subprocess
 import requests
+from time import time
 
 app = FastAPI()
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
 MODEL = "gemma:2b"
-API_KEY = os.getenv("JARVIS_API_KEY", "mysecret123")
+API_KEY = os.getenv("JARVIS_API_KEY")
 
 BASE_DIR = os.path.abspath(".")
 MAX_STEPS = 5
@@ -17,10 +18,13 @@ MAX_FILE_SIZE = 10000
 MAX_ITERATIONS = 3
 MAX_STATE_RESULTS = 2
 MAX_STATE_TEXT = 500
+RATE_LIMIT_SECONDS = 1.0
 
 ALLOWED_COMMANDS = ["ls", "pwd"]
 ALLOWED_ACTIONS = ["list_files", "read_file", "write_file", "run_command"]
 ALLOWED_MODES = ["PLAN", "REPAIR", "CONTINUE"]
+
+last_call = {}
 
 ALLOWED_FIELDS = {
     "list_files": {"action", "path"},
@@ -601,10 +605,37 @@ def execute_steps(steps):
     return results
 
 
+def get_client_id(request: Request):
+    forwarded_for = request.headers.get("x-forwarded-for", "")
+    if forwarded_for:
+        return forwarded_for.split(",")[0].strip()
+
+    if request.client and request.client.host:
+        return request.client.host
+
+    return "unknown"
+
+
+def is_rate_limited(client_id):
+    now = time()
+    if client_id in last_call and now - last_call[client_id] < RATE_LIMIT_SECONDS:
+        return True
+
+    last_call[client_id] = now
+    return False
+
+
 @app.post("/run")
 def run_task(data: dict, request: Request):
+    if not API_KEY:
+        return {"error": "server_not_configured"}
+
     if request.headers.get("x-api-key") != API_KEY:
         return {"error": "unauthorized"}
+
+    client_id = get_client_id(request)
+    if is_rate_limited(client_id):
+        return {"error": "rate_limited"}
 
     user_input = (data.get("input") or "").strip()
     if not user_input:
