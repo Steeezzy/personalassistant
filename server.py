@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 import json
 import os
 import re
@@ -9,6 +9,7 @@ app = FastAPI()
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
 MODEL = "gemma:2b"
+API_KEY = os.getenv("JARVIS_API_KEY", "mysecret123")
 
 BASE_DIR = os.path.abspath(".")
 MAX_STEPS = 5
@@ -601,7 +602,10 @@ def execute_steps(steps):
 
 
 @app.post("/run")
-def run_task(data: dict):
+def run_task(data: dict, request: Request):
+    if request.headers.get("x-api-key") != API_KEY:
+        return {"error": "unauthorized"}
+
     user_input = (data.get("input") or "").strip()
     if not user_input:
         return {"error": "Missing input"}
