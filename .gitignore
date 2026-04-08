@@ -2,3 +2,6 @@ __pycache__/
 *.pyc
 .qodo/
 .jarvis_memory.json
+goal_queue.json
+goal_queue.json.lock
+input.wav
